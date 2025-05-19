@@ -1,0 +1,216 @@
+classdef Packet < handle
+    properties
+        id                  % Уникальный идентификатор пакета
+        source              % Исходный узел (отправитель)
+        destination         % Узел назначения (получатель)
+        % lastSourceNode      % Последний узел, в котором находился пакет
+        % nextDestinationNode % Следующий узел на пути следования пакета
+        route               % маршрут пакета
+        currentHop = 1      % текущий узел в маршруте
+        size                % Размер пакета в байтах (по умолчанию 1500)
+        payload             % Полезная нагрузка (данные)
+        sequenceNumber      % Порядковый номер в сообщении
+        totalPackets        % Общее количество пакетов в сообщении
+        ttl                 % Time To Live (макс. число переходов)
+        sendTime            % Время создания пакета
+        checksum            % Контрольная сумма для проверки целостности
+        priority            % Приоритет пакета (0-7, где 7 - наивысший)
+        direction           % направление (request/response)
+        
+        totalProcessingTime = 0  % Общее время обработки
+        totalTransmissionTime = 0 % Общее время передачи
+        totalQueueTime = 0       % Общее время в очередях
+        queueStartTime           % Время начала нахождения в очереди
+        localQueueTime = 0
+        currentArrivalTime       % Время поступления на текущий узел
+    end
+    
+    properties (Constant)
+        DEFAULT_SIZE = 1500;
+        DEFAULT_PAYLOAD = "Default packet";
+        DEFAULT_PRIORITY = 0;
+        DEFAULT_TTL = 64;
+        DEFAULT_DIRECTION = "request";
+    end
+    
+    methods
+        function obj = Packet(source, destination, payload, sendTime, direction, varargin)
+            % Конструктор класса Packet
+            % Обязательные параметры:
+            %   source - отправитель
+            %   destination - получатель
+            %   payload - полезная нагрузка
+            %
+            % Дополнительные параметры (пары имя-значение):
+            %   'Size' - размер пакета
+            %   'SequenceNumber' - порядковый номер
+            %   'TotalPackets' - общее число пакетов
+            %   'Priority' - приоритет
+            
+            if nargin == 0
+                % дефолтный пакет
+                % obj.source = [];
+                % obj.destination = [];
+                % obj.payload = Packet.DEFAULT_PAYLOAD;
+                % obj.direction = DEFAULT_DIRECTION;
+                % obj.size = Packet.DEFAULT_SIZE;
+                % obj.priority = Packet.DEFAULT_PRIORITY;
+                % obj.ttl = Packet.DEFAULT_TTL;
+                % % obj.lastSourceNode = [];
+                % % obj.nextDestinationNode = [];
+                % obj.sequenceNumber = 1;
+                % obj.totalPackets = 1;
+                
+                error('Невозможно создать Packet: не хватает параметров.')
+            else
+                
+                % Парсинг входных аргументов
+                p = inputParser;
+                % addRequired(p, 'source', @(x) isa(x, 'Node'));
+                % addRequired(p, 'destination', @(x) isa(x, 'Node'));
+                % addRequired(p, 'payload');
+                
+                
+                % Технические параметры пакета
+                addParameter(p, 'Size', 1500, @isnumeric);
+                addParameter(p, 'SequenceNumber', 1, @isnumeric);
+                addParameter(p, 'TotalPackets', 1, @isnumeric);
+                addParameter(p, 'Priority', 0, @(x) x >=0 && x <=7);
+                % Параметры маршрутизации
+                % addParameter(p, 'LastSourceNode', source, @(x) isa(x, 'Node'));
+                % addParameter(p, 'NextDestinationNode', destination, @(x) isa(x, 'Node'));
+                
+                parse(p, varargin{:});
+                
+                % Генерация уникального ID (можно использовать хэш или случайное число)
+                persistent packetCounter;
+                if isempty(packetCounter)
+                    packetCounter = 1;
+                else
+                    packetCounter = packetCounter + 1;
+                end
+                
+                % Инициализация свойств
+                obj.id = packetCounter;
+                obj.source = source;
+                obj.destination = destination;
+                obj.size = p.Results.Size;
+                obj.payload = payload;
+                obj.sequenceNumber = p.Results.SequenceNumber;
+                obj.totalPackets = p.Results.TotalPackets;
+                obj.ttl = 64;                          % Стандартное значение TTL
+                obj.sendTime = sendTime;
+                obj.checksum = obj.calculateChecksum();
+                obj.priority = p.Results.Priority;
+                %obj.lastSourceNode = p.Results.LastSourceNode;
+                % obj.nextDestinationNode = p.Results.NextDestinationNode;
+                obj.direction = direction;
+                
+                obj.currentArrivalTime = sendTime;
+            end
+        end
+        
+        function equal = isEqual(obj, otherPacket)
+            % Сравнивает пакеты по ID и другим характеристикам
+            equal = false;
+            if ~isa(otherPacket, 'Packet')
+                return;
+            end
+            equal = (obj.id == otherPacket.id && ...
+                obj.source.id == otherPacket.source.id && ...
+                obj.destination.id == otherPacket.destination.id && ...
+                obj.size == otherPacket.size && ...
+                length(obj.payload) == length(otherPacket.payload) && ...
+                obj.sequenceNumber == otherPacket.sequenceNumber && ...
+                obj.totalPackets == otherPacket.totalPackets && ...
+                obj.sendTime == otherPacket.sendTime && ...
+                obj.ttl == otherPacket.ttl && ...
+                obj.checksum == otherPacket.checksum && ...
+                obj.priority == otherPacket.priority && ...
+                obj.direction == otherPacket.direction);
+        end
+        
+        function checksum = calculateChecksum(obj)
+            % Простая реализация расчета контрольной суммы
+            numeric = double(unicode2native(obj.payload, 'UTF-8'));
+            
+            checksum = mod(sum(numeric), 65535);
+        end
+        
+        function isValid = verifyChecksum(obj)
+            % Проверка целостности пакета
+            isValid = (obj.checksum == obj.calculateChecksum());
+        end
+        
+        function obj = addProcessingTime(obj, processingTime)
+            obj.totalProcessingTime = obj.totalProcessingTime + processingTime;
+        end
+        
+        function obj = addTransmissionTime(obj, transmissionTime)
+            obj.totalTransmissionTime = obj.totalTransmissionTime + transmissionTime;
+        end
+        
+        function totalTime = getTotalTime(obj)
+            totalTime = obj.totalProcessingTime + obj.totalTransmissionTime + obj.totalQueueTime;
+        end
+        
+        function expired = isExpired(obj, currentTime)
+            expired = (currentTime - obj.sendTime) > 60 || obj.getTotalTime() > 60;
+        end
+        
+        function obj = markQueueStart(obj, currentTime)
+            % Запоминаем время поступления в очередь
+            obj.queueStartTime = currentTime;
+        end
+        
+        function obj = addQueueTime(obj, currentTime)
+            % Добавляем время, проведенное в очереди
+            if ~isempty(obj.queueStartTime)
+                % queueTime = currentTime - obj.queueStartTime;
+                if currentTime 
+                obj.localQueueTime = currentTime - obj.queueStartTime;
+            end
+        end
+        
+    end
+    
+    methods (Static)
+        function packets = createFromMessage(message, source, destination, direction, packetSize)
+            % Создает массив пакетов из сообщения
+            % message - строка или бинарные данные
+            % packetSize - максимальный размер пакета
+            
+            if nargin < 5
+                packetSize = Packet.DEFAULT_SIZE; % По умолчанию MTU 1500 байт
+            end
+            
+            % Разбиваем сообщение на части
+            data = uint8(message);
+            totalBytes = length(data);
+            numPackets = ceil(totalBytes / packetSize);
+            
+            % Инициализируем массив пакетов
+            packets = Packet.empty(numPackets, 0);
+            
+            for i = 1:numPackets
+                startIdx = (i-1)*packetSize + 1;
+                endIdx = min(i*packetSize, totalBytes);
+                payload = data(startIdx:endIdx);
+                
+                packets(i) = Packet(source, destination, char(payload), direction, ...
+                    'Size', length(payload), ...
+                    'SequenceNumber', i, ...
+                    'TotalPackets', numPackets);
+            end
+        end
+    end
+end
+
+% Вспомогательная функция для краткого if-else
+function s = iif(condition, trueVal, falseVal)
+if condition
+    s = trueVal;
+else
+    s = falseVal;
+end
+end

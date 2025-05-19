@@ -1,0 +1,1062 @@
+classdef NetworkModel < handle
+    properties
+        % Параметры сети
+        nodes               % Узлы сети (Node[])
+        connections         % Соединения между узлами (Connection[])
+        topology            % Матрица связности узлов (numNodes x numNodes)
+        zonesInfo           % Словарь с информацией о зонах сети: диапазонами индексов узлов в данной зоне, и параматерами надежности
+        connectionZonesInfo % словарь с информацией о зонах соединений сети: параметры надежности
+        numNodes            % Количество узлов
+        serverNodes         % Конечные обрабатывающие узлы (Nodes[])
+        packetSize          % Размер пакетов по умолчанию, Байт
+        reactionTime        % Время простоя (полной реакции), с
+        serviceTime         % Время обслуживания, с
+        servicePeriod       % Период обслуживания, с
+        repairTeamsTotal    % Число бригад для обслуживания узлов
+        repairTeamsBusy     % Количество занятых бригад
+        repairQueueNodes    % Очередь узлов на восстановление
+        repairQueueConns    % Очередь соединений на восстановление
+        
+        
+        % Клиенты
+        clients             % Массив клиентов (Node[])
+        numClients          % Количество клиентов
+        V_THRESHOLD         % Порог интенсивности приходящих клиентам кадров (v_in > V_THRESHOLD * v_out) ? 1 : 0
+        % clientIntensity   % Интенсивность выходящих от клиентов пакетов
+        clientFreqMin       % нижняя граница интенсивности выходящих от клиентов кадров для треугольного распределения
+        clientFreqMax       % верхняя граница интенсивности выходящих от клиентов кадров для треугольного распределения
+        
+        % Параметры моделирования
+        currentTime         % Текущее модельное время, с
+        simDuration         % Длительность моделирования, с
+        % sendingInterval   % Интервал отправки сообщений клиентами
+        timeStep            % Временной интервал моделирования, с
+        exp                 % номер эксперимента
+        
+        % Состояния сети
+        stateTimes          % Время пребывания в каждом состоянии [S1, S2, S3], с
+        stateTransitions    % Счетчики переходов состояний
+        currentState        % Текущее состояние сети
+        lastStateChangeTime % Время последнего изменения состояния, с
+        S2_CRITICAL         % Пороговое значение доли клиентов, получающих кадры для перехода в состояние S2
+        S3_CRITICAL         % Пороговое значение доли клиентов, получающих кадры для перехода в состояние S3
+        
+        % Статистика
+        packetsGenerated    % Сгенерировано пакетов за один временной интервал timeStep
+        packetsDelivered    % Доставлено пакетов за один временной интервал timeStep
+        packetsLost         % Потеряно пакетов за один временной интервал timeStep
+        packetsExpired        % Потеряно пакетов за один временной интервал timeStep
+        nodeFailures        % Отказы узлов за один временной интервал timeStep
+        connFailures        % Отказы соединений за один временной интервал timeStep
+        
+        % История для статистики в однократном прогоне. Отключить для серии экспериментов
+        T0_1_history
+        T0_2_history
+        Tv_1_history
+        Tv_2_history
+        Kg_1_history
+        Kg_2_history
+        time_history
+        state_history
+        
+        packetsGenerated_history
+        packetsDelivered_history
+        packetsLost_history
+        packetsExpired_history
+        nodeFailures_history
+        connFailures_history
+    end
+    
+    methods
+        function initializeNetwork(obj, exp, topology, zonesInfo, connectionZonesInfo, params)
+            % Инициализация сети на основе матрицы связности
+            % topology - матрица NxN, где 1 означает наличие связи
+            % params - структура с параметрами узлов и соединений
+            
+            % Проверка входных данных
+            if size(topology,1) ~= size(topology,2)
+                error('Матрица связности должна быть квадратной');
+            end
+            
+            if ~isa(zonesInfo, 'containers.Map')
+                error('Параметр zones должен быть типа containers.Map');
+            end
+            obj.exp = exp;
+            
+            obj.topology = topology;
+            obj.zonesInfo = zonesInfo;
+            obj.connectionZonesInfo = connectionZonesInfo;
+            obj.numNodes = size(topology, 1);
+            obj.numClients = params.numClients;
+            obj.nodes = Node.empty(obj.numNodes, 0);
+            obj.serverNodes = Node.empty(length(params.serverNodes), 0);
+            obj.connections = Connection.empty(0, 0);
+            obj.clients = Node.empty(obj.numClients, 0);
+            obj.simDuration = params.simDuration;
+            obj.packetSize = params.packetSize;
+            % obj.sendingInterval = params.sendingInterval;
+            obj.timeStep = params.timeStep;
+            obj.V_THRESHOLD = params.vThreshold;
+            obj.S2_CRITICAL = params.s2Critical;
+            obj.S3_CRITICAL = params.s3Critical;
+            % obj.clientIntensity = params.clientIntensity;
+            obj.clientFreqMin = params.clientFreqMin;
+            obj.clientFreqMax = params.clientFreqMax;
+            obj.reactionTime = params.reactionTime;
+            obj.serviceTime = params.serviceTime;
+            obj.servicePeriod = params.servicePeriod;
+            
+            obj.repairTeamsTotal = params.repairTeamsTotal;
+            obj.repairTeamsBusy = 0;
+            obj.repairQueueNodes = [];
+            obj.repairQueueConns = [];
+            
+            % Создаем узлы с учетом зон
+            zoneNames = keys(zonesInfo);
+            
+            % Создаем узлы
+            for i = 1:obj.numNodes
+                nodeZone = 'DEFAULT';
+                zoneParams = struct('failureRate', params.failureRate, ...
+                    'meanRecoveryTime', params.meanRecoveryTime, ...
+                    'bandwidth', params.nodeBandwidth);
+                
+                for z = 1:length(zoneNames)
+                    zone = zonesInfo(zoneNames{z});
+                    if ismember(i, zone.nodeIdx)
+                        nodeZone = zoneNames{z};
+                        zoneParams.failureRate = zone.failureRate;
+                        zoneParams.meanRecoveryTime = zone.meanRecoveryTime;
+                        zoneParams.bandwidth = zone.bandwidth;
+                        break;
+                    end
+                end
+                
+                % nodeName = sprintf('Node%d', i);
+                obj.nodes(i) = Node(i, ...
+                    params.bufferCapacity, ...
+                    zoneParams.bandwidth, ...
+                    zoneParams.failureRate, ...
+                    zoneParams.meanRecoveryTime, ...
+                    params.detectionTime, ...
+                    obj);
+                
+                obj.nodes(i).zone = nodeZone;
+                
+                
+                % Помечаем серверные узлы
+                if ismember(i, params.serverNodes)
+                    obj.serverNodes(end+1) = obj.nodes(i);
+                end
+                
+                % Помечаем клиентов
+                if i <= obj.numClients
+                    obj.nodes(i).isClientNode = true;
+                    obj.clients(end + 1) = obj.nodes(i);
+                end
+            end
+            
+            % Создаем соединения на основе матрицы связности
+            for i = 1:obj.numNodes
+                for j = i+1:obj.numNodes % Чтобы не дублировать соединения
+                    if topology(i,j) == 1
+                        % Создаем соединение с параметрами из params
+                        % conn = Connection(obj.nodes(i), obj.nodes(j), ...
+                        %     params.bandwidth, ...
+                        %     params.connFailureRate, ...
+                        %     params.connRecoveryTime, ...
+                        %     params.connDetectionTime);
+                        
+                        % Добавляем соединение к обоим узлам
+                        % obj.nodes(i).addConnection(conn);
+                        % obj.nodes(j).addConnection(conn);
+                        
+                        [zoneParams, zoneName] = obj.determineConnectionZone(i, j);
+                        
+                        [node1, node2, conn] = connectNodes(obj.nodes(i), obj.nodes(j), ...
+                            zoneParams.bandwidth, zoneParams.failureRate, ...
+                            zoneParams.meanRecoveryTime, params.detectionTime);
+                        
+                        conn.zone = zoneName;
+                        
+                        % Сохраняем соединение в модели
+                        obj.connections(end+1) = conn;
+                    end
+                end
+            end
+            
+            obj.stateTimes = zeros(1, 3); % S1, S2, S3
+            obj.stateTransitions = zeros(3, 3);
+            obj.currentState = 1; % Начинаем в рабочем состоянии
+            obj.lastStateChangeTime = 0;
+            obj.packetsGenerated = 0;
+            obj.packetsDelivered = 0;
+            obj.packetsLost = 0;
+            obj.packetsExpired = 0;
+            obj.nodeFailures = 0;
+            obj.connFailures = 0;
+            obj.currentTime = 0;
+            
+            % История для статистики в однократном прогоне. Отключить для серии экспериментов
+            obj.T0_1_history = [];
+            obj.T0_2_history = [];
+            obj.Tv_1_history = [];
+            obj.Tv_2_history = [];
+            obj.Kg_1_history = [];
+            obj.Kg_2_history = [];
+            obj.time_history = [];
+            obj.state_history = [];
+            
+            obj.packetsGenerated_history = [];
+            obj.packetsDelivered_history = [];
+            obj.packetsLost_history = [];
+            obj.packetsExpired_history = [];
+            obj.nodeFailures_history = [];
+            obj.connFailures_history = [];
+            
+            obj.T0_1_history(1) = 0;
+            obj.T0_2_history(1) = 0;
+            obj.Tv_1_history(1) = 0;
+            obj.Tv_2_history(1) = 0;
+            obj.Kg_1_history(1) = 0;
+            obj.Kg_2_history(1) = 0;
+            obj.time_history(1) = 0;
+            obj.packetsGenerated_history(1) = 0;
+            obj.packetsDelivered_history(1) = 0;
+            obj.packetsExpired_history(1) = 0;
+            obj.packetsLost_history(1) = 0;
+            obj.nodeFailures_history(1) = 0;
+            obj.connFailures_history(1) = 0;
+        end
+        
+        function [T0_1, T0_2, Tv_1, Tv_2, Kg_1, Kg_2, lambda_12, ...,
+                lambda_13, lambda_21, lambda_23, ...,
+                lambda_31, lambda_32] = startSimulation(obj)
+            % profile on  % профилирование
+            
+            nextServiceStart = obj.servicePeriod;
+            nextServiceEnd = nextServiceStart + obj.serviceTime;
+            isInService = false;
+            obj.currentTime = obj.timeStep;
+            
+            obj.state_history(1) = obj.currentState;
+            
+            while obj.currentTime <= obj.simDuration
+                if obj.timeStep == 0
+                    break;
+                end
+                obj.packetsDelivered = 0;
+                obj.packetsGenerated = 0;
+                obj.packetsLost = 0;
+                obj.packetsExpired = 0;
+                [obj.clients(:).isClientSent] = deal(false);
+                
+                if ~isInService && obj.currentTime >= nextServiceStart
+                    isInService = true;
+                    nextServiceEnd = nextServiceStart + obj.serviceTime;
+                    fprintf('[Exp: %d] [Обслуживание] Начало периода обслуживания: %.1f-%.1f\n', ...
+                        obj.exp, obj.currentTime, nextServiceEnd);
+                    obj.handleServiceRecoveries(obj.currentTime);
+                    obj.changeNetworkState();
+                end
+                
+                if isInService && obj.currentTime >= nextServiceEnd
+                    isInService = false;
+                    nextServiceStart = nextServiceEnd + obj.servicePeriod;
+                    fprintf('[Exp: %d] [Обслуживание] Конец периода обслуживания: %.1f\n', obj.exp, obj.currentTime);
+                    
+                    newState = 1;
+                    prevState = obj.currentState;
+                    if newState ~= obj.currentState
+                        obj.stateTransitions(obj.currentState, newState) = obj.stateTransitions(obj.currentState, newState) + 1;
+                    end
+                    % timeInState = obj.currentTime - nextServiceEnd;
+                    % obj.stateTimes(newState) = obj.stateTimes(obj.currentState) + timeInState;
+                    obj.currentState = newState;
+                    obj.lastStateChangeTime = obj.currentTime;
+                    %fprintf('\n[Exp: %d] Состояние сети изменилось после обслуживания: S%d -> S%d\n', exp, prevState, newState);
+                end
+                
+                % Пересылка сообщений
+                if ~isInService && obj.currentTime < nextServiceStart
+                    % obj.handleFailures(obj.currentTime);
+                    % Обработка отказов узлов и соединений
+                    obj.handleFailures(obj.currentTime);
+                    if obj.timeStep == 20
+                        fprintf("Hello\n");
+                    end
+                    packetData = obj.preparePacketsByIntensity();
+                    fprintf('[Exp: %d] Отправка запросов в %d-%dс\n', obj.exp, obj.currentTime - obj.timeStep, obj.currentTime);
+                    
+                    totalPackets = length(packetData);
+                    obj.packetsGenerated = totalPackets;
+                    for i = 1:totalPackets
+                        data = packetData(i);
+                        client = obj.clients(data.clientId);
+                        
+                        try
+                            % Отправляем пакет
+                            % processingTime = client.processingTime;
+                            % data.packet.addProcessingTime(processingTime);
+                            sendingTime = data.packet.sendTime;
+                            
+                            client.isClientSent = true;
+                            obj.handleRecoveries(data.packet.sendTime);
+                            transNodes = obj.nodes(obj.numClients + 1 : length(obj.nodes));
+                            client.sendPackets(transNodes, data.packet.destination, data.packet, sendingTime);
+                            obj.packetsDelivered = obj.packetsDelivered + 1;
+                            
+                            % progress = floor(i/totalPackets * 100);
+                            % if mod(progress, 5) == 0 && (i == 1 || progress ~= floor((i-1)/totalPackets * 100))
+                            %     fprintf('\r[Exp: %d] Обработано запросов: %d%% (%d/%d запросов)', exp, progress, i, totalPackets);
+                            % end
+                        catch ME
+                            if contains(ME.message, 'expired')
+                                obj.packetsExpired = obj.packetsExpired + 1;
+                            else
+                                obj.packetsLost = obj.packetsLost + 1;
+                                % fprintf('[Exp: %d] [ERROR]  Клиент: %d. Не удалось обработать запрос: %s\n', ...
+                                %     obj.exp, data.clientId, ME.message);
+                            end
+                        end
+                    end
+                    
+                    obj.changeNetworkState();
+                    
+                    % fprintf('\n[Exp: %d] Состояние сети изменилось: S%d -> S%d\n', exp, prevState, newState);
+                    %
+                    % % 5. Вывод статистики
+                    % fprintf('\n[Exp: %d] === Статистика за период %d-%d сек ===\n', ...
+                    %       exp, obj.currentTime, obj.currentTime+obj.timeStep);
+                    % fprintf('[Exp: %d] Клиенты получающие кадры: %d/%d (%.1f%%)\n', ...
+                    %        exp, numReceivingClients, numSendingClients, receivingRatio*100);
+                    % fprintf('[Exp: %d] Интенсивности клиентов\n', exp);
+                    % fprintf('%-10s %-10s %-10s %-10s %-10s\n', 'ID', 'RecInt', 'SendInt', 'Порог', 'Вывод');
+                    % for i = 1:length([obj.clients.isClientSent])
+                    %     idx = obj.clients(i).id;
+                    %     recInt = obj.clients(i).packetStats.receiveIntensity;
+                    %     sendInt = obj.clients(i).packetStats.sendIntensity;
+                    %     porog = obj.V_THRESHOLD * obj.clients(i).packetStats.sendIntensity;
+                    %     res = obj.clients(i).packetStats.receiveIntensity > porog;
+                    %     fprintf("%-10d %-10.3f %-10.3f %-10.3f %-10d\n", idx, recInt, sendInt, porog, res);
+                    % end
+                    % fprintf('[Exp: %d] Текущее состояние сети: S%d\n', exp, obj.currentState);
+                    % fprintf('[Exp: %d] Время в состояниях: S1=%.1fs, S2=%.1fs, S3=%.1fs\n', ...
+                    %        exp, obj.stateTimes(1), obj.stateTimes(2), obj.stateTimes(3));
+                end
+                
+                % Для однократного прогона. Отключить для серии экспериментов.
+                [T0_1, T0_2, Tv_1, Tv_2, Kg_1, Kg_2] = obj.calculateCurrentMetrics();
+                
+                obj.T0_1_history(end+1) = T0_1;
+                obj.T0_2_history(end+1) = T0_2;
+                obj.Tv_1_history(end+1) = Tv_1;
+                obj.Tv_2_history(end+1) = Tv_2;
+                obj.Kg_1_history(end+1) = Kg_1;
+                obj.Kg_2_history(end+1) = Kg_2;
+                obj.time_history(end+1) = obj.currentTime;
+                obj.state_history(end+1) = obj.currentState;
+                
+                obj.packetsGenerated_history(end+1) = obj.packetsGenerated;
+                obj.packetsDelivered_history(end+1) = obj.packetsDelivered;
+                obj.packetsExpired_history(end+1) = obj.packetsExpired;
+                obj.packetsLost_history(end+1) = obj.packetsLost;
+                obj.nodeFailures_history(end+1) = obj.nodeFailures;
+                obj.connFailures_history(end+1) = obj.connFailures;
+                
+                if obj.simDuration - obj.currentTime < obj.timeStep
+                    obj.timeStep = obj.simDuration- obj.currentTime;
+                end
+
+                obj.currentTime = obj.currentTime + obj.timeStep;
+            end
+            
+            % Расчет показателей надежности после завершения симуляции
+            Ts1 = obj.stateTimes(1);
+            Ts2 = obj.stateTimes(2);
+            Ts3 = obj.stateTimes(3);
+            
+            countTransitionsToS1 = obj.stateTransitions(2,1) + obj.stateTransitions(3,1);
+            countTransitionsFromS3 = obj.stateTransitions(3,1) + obj.stateTransitions(3,2);
+            countTransitionsFromS1 = obj.stateTransitions(1,2) + obj.stateTransitions(1,3);
+            countTransitionsToS3 = obj.stateTransitions(1,3) + obj.stateTransitions(2,3);
+            % countTransitionsToS2 = obj.stateTransitions(1,2) + obj.stateTransitions(3,2);
+            
+            totalTime = obj.simDuration;
+            totalTimeWithoutService = totalTime - obj.serviceTime * floor((totalTime / (obj.servicePeriod + obj.serviceTime)));
+            
+            if Ts1 < obj.serviceTime * floor((totalTime / (obj.servicePeriod + obj.serviceTime)))
+                Ts1WithoutService = Ts1;
+            else
+                Ts1WithoutService = Ts1 - obj.serviceTime * floor((totalTime / (obj.servicePeriod + obj.serviceTime)));
+            end
+            
+            % Ts1WithoutService = Ts1 - obj.serviceTime * floor((totalTime / (obj.servicePeriod + obj.serviceTime)));
+            % Ts2WithoutService = Ts2 - obj.serviceTime * ceil((totalTime / (obj.servicePeriod + obj.serviceTime)));
+            
+            % Расчет наработки на отказ и времени восстановления
+            % if countTransitionsFromS1 == 0
+            %     T0_1 = Ts1WithoutService / (1 + countTransitionsFromS1);
+            
+            % else
+            %     T0_1 = Ts1WithoutService / (countTransitionsFromS1);
+            % end
+            
+            % if countTransitionsToS3 == 0
+            %     T0_2 = (Ts1WithoutService + Ts2) / (1 + countTransitionsToS3);
+            
+            % else
+            %     T0_2 = (Ts1WithoutService + Ts2) / (countTransitionsToS3);
+            % end
+            T0_1 = Ts1WithoutService / (1 + countTransitionsFromS1);
+            T0_2 = (Ts1WithoutService + Ts2) / (1 + countTransitionsToS3);
+            
+            if Ts2 + Ts3 < (obj.reactionTime * (countTransitionsToS1))
+                Tv_1 = Ts2 + Ts3;
+            else
+                Tv_1 = Ts2 + Ts3 - (obj.reactionTime * (countTransitionsToS1)); % С учетом времени реакции
+            end
+            
+            if Ts3 < (obj.reactionTime * (countTransitionsFromS3)) % с учетом времени реакции
+                Tv_2 = Ts3;
+            else
+                Tv_2 = Ts3 - (obj.reactionTime * (countTransitionsFromS3)); % С учетом времени реакции
+            end
+            
+            Kg_1 = T0_1 / (T0_1 + Tv_1);
+            Kg_2 = T0_2 / (T0_2 + Tv_2);
+            
+            
+            % 3. Расчет интенсивностей переходов
+            lambda_12 = obj.stateTransitions(1,2) / totalTimeWithoutService;
+            lambda_13 = obj.stateTransitions(1,3) / totalTimeWithoutService;
+            lambda_21 = obj.stateTransitions(2,1) / totalTimeWithoutService;
+            lambda_23 = obj.stateTransitions(2,3) / totalTimeWithoutService;
+            lambda_31 = obj.stateTransitions(3,1) / totalTimeWithoutService;
+            lambda_32 = obj.stateTransitions(3,2) / totalTimeWithoutService;
+            
+            % Для однократного прогона. Отключить для серии экспериментов
+            obj.plotReliabilityMetrics();
+            obj.plotStateTimes();
+            obj.plotNetworkStats();
+            
+            % profile off % Выключаем профилирование
+            % profile viewer % Открываем визуализатор профилирования
+        end
+        
+        function messages = prepareMessages(obj)
+            numOfClientsSending = randi([1,36]);
+            clientsIds = randperm(obj.numClients, numOfClientsSending);
+            messages(numOfClientsSending) = struct('packets', [], 'server', 0, 'clientId', 0);
+            % Заполнение структур
+            for i = 1:numOfClientsSending
+                messages(i).server   = randi([69, 70]);
+                messages(i).clientId = clientsIds(i);
+                message  = repmat('Network Packet Simulation Data ', 1, randi([100, 150]));
+                packets = Packet.createFromMessage(message, obj.nodes(messages(i).clientId), obj.nodes(messages(i).server), "request", obj.packetSize);
+                messages(i).packets = packets;
+            end
+        end
+        
+        function [packetData] = preparePacketsByIntensity(obj)
+            packetData = struct('clientId', {}, 'receiverId', {}, 'packet', {}, 'sendTime', {});
+            
+            % Для каждого клиента
+            for i = 1:obj.numClients
+                client = obj.clients(i);
+                
+                % 1. Получаем случайную интенсивность для клиента (пакетов/сек)
+                a = obj.clientFreqMin;
+                b = obj.clientFreqMax;
+                c = a + (b - a) / 2;
+                F = (c - a)/(b - a);
+                
+                U = rand();
+                if U <= F
+                    client.packetStats.outIntensity = a + sqrt(U*(b - a)*(c - a));
+                else
+                    client.packetStats.outIntensity = b - sqrt((1 - U)*(b - a)*(b - c));
+                end
+                
+                % 2. Рассчитываем количество пакетов для интервала
+                nPackets = round(client.packetStats.outIntensity * obj.timeStep);
+                
+                % 3. Генерируем пакеты, если нужно
+                if nPackets > 0
+                    % Генерируем уникальные временные метки для пакетов этого клиента
+                    timeOffsets = round(1 + (obj.timeStep-1)*rand(1, nPackets)); % [1,obj.timeStep]
+                    timeStamps = (obj.currentTime - obj.timeStep) + sort(timeOffsets); % Сортируем по времени
+                    
+                    % Создаем массив для хранения sequence numbers
+                    seqNumbers = zeros(1, nPackets);
+                    serverIndices = randi([69,70], 1, nPackets);
+                    % serverIndices = obj.serverNodes(randi(numel(obj.serverNodes), 1, nPackets));
+                    
+                    % Для каждого уникального времени и сервера определяем количество пакетов
+                    [uniquePairs, ~, ic] = unique([timeStamps', serverIndices'], 'rows');
+                    
+                    for k = 1:size(uniquePairs,1)
+                        idx = (ic == k); % Индексы пакетов с этим временем и сервером
+                        count = sum(idx);
+                        seqNumbers(idx) = 1:count; % Присваиваем sequence numbers
+                    end
+                    
+                    for j=1:nPackets
+                        packet = Packet(client, obj.nodes(serverIndices(j)), "Test message", timeStamps(j), "request", 'Size', obj.packetSize, 'SequenceNumber', seqNumbers(j));
+                        % Добавляем данные пакета в массив структур
+                        packetData(end+1) = struct(...
+                            'clientId', i, ...
+                            'receiverId', serverIndices(j), ...
+                            'packet', packet, ...
+                            'sendTime', timeStamps(j) ...
+                            );
+                    end
+                end
+                
+                % fprintf('Client %d sent packets at %d: %d\n', client.id, obj.currentTime, nPackets);
+            end
+            
+            % Сортируем пакеты по времени отправки
+            if ~isempty(packetData)
+                [~, idx] = sort([packetData.sendTime]);
+                packetData = packetData(idx);
+            else
+                % Если нет пакетов, возвращаем пустую структуру
+                packetData = struct('clientId', 0, 'receiverId', 0, 'packet', [], 'sendTime', 0);
+            end
+            
+        end
+        
+        function handleFailures(obj, currentTime)
+            % Обработка отказов узлов
+            for i = 1:length(obj.nodes)
+                node = obj.nodes(i);
+                
+                if node.isClientNode
+                    continue;
+                end
+                
+                % Моделируем отказ узла
+                if ~node.isFailed && currentTime >= node.nextFailureTime
+                    node.isFailed = true;
+                    node.scheduleRecovery();
+                    obj.nodeFailures = obj.nodeFailures + 1;
+                    fprintf('[Exp: %d] Узел %d отказал в момент времени %.1f. Планируемое время восстановления: %.1f\n', obj.exp, node.id, node.nextFailureTime, node.nextRecoveryTime);
+                    obj.repairQueueNodes = [obj.repairQueueNodes, node];
+                end
+                
+                % % Моделируем восстановление узла
+                % if node.isFailed && currentTime >= node.nextRecoveryTime
+                %     recTime = node.nextRecoveryTime;
+                %     node.isFailed = false;
+                %     node.scheduleNextFailure(currentTime);
+                %     node.nextRecoveryTime = NaN;
+                %     obj.nodeFailures = obj.nodeFailures - 1;
+                %     fprintf('[Exp: %d] Узел %d восстановлен в момент времени %.1f. Следующий отказ: %.1f\n', obj.exp, node.id, recTime, node.nextFailureTime);
+                % end
+            end
+            
+            % Обработка отказов соединений
+            for i = 1:length(obj.connections)
+                conn = obj.connections(i);
+                
+                % Моделируем отказ соединения
+                if ~conn.isFailed && currentTime >= conn.nextFailureTime
+                    conn.isFailed = true;
+                    conn.scheduleRecovery();
+                    obj.connFailures = obj.connFailures + 1;
+                    obj.repairQueueConns = [obj.repairQueueConns, conn];
+                    fprintf('[Exp: %d] Соединение %s отказало в момент времени %.1f. Планируемое восстановление: %.1f\n', obj.exp, conn.name, conn.nextFailureTime, conn.nextRecoveryTime);
+                end
+                
+                % % Моделируем восстановление соединения
+                % if conn.isFailed && currentTime >= conn.nextRecoveryTime
+                %     recTime = conn.nextRecoveryTime;
+                %     conn.isFailed = false;
+                %     conn.scheduleNextFailure(currentTime);
+                %     conn.nextRecoveryTime = NaN;
+                %     obj.connFailures = obj.connFailures - 1;
+                %     fprintf('[Exp: %d] Соединение %s восстановлено в момент времени %.1f. Следующий отказ: %.1f\n', obj.exp,  conn.name, recTime, conn.nextFailureTime);
+                % end
+            end
+            
+            obj.processRepairQueue(currentTime)
+            
+            % Логирование
+            % failedNodes = obj.nodes([obj.nodes.isFailed]);
+            % failedConnections = obj.connections([obj.connections.isFailed]);
+            % fprintf('Current time: %.2f-%.2f FAILED NODES:\n', obj.currentTime, obj.currentTime + obj.timeStep );
+            % fprintf('%-10s %-20s %-20s\n', 'Index', 'Failure Time', 'Next Recovery Time');
+            % for i = 1:length(failedNodes)
+            %         idx = failedNodes(i).id;
+            %         nextFailureTime = failedNodes(i).nextFailureTime;
+            %         nextRecoveryTime = failedNodes(i).nextRecoveryTime;
+            %         fprintf('%-10d %-20.4f %-20.4f\n', idx, nextFailureTime, nextRecoveryTime);
+            % end
+            % fprintf('Current time: %.2f-%.2f FAILED CONNECTIONS:\n', obj.currentTime, obj.currentTime + obj.timeStep);
+            % fprintf('%-10s %-20s %-20s\n', 'From -> To', 'Failure Time', 'Next Recovery Time');
+            % for i = 1:length(failedConnections)
+            %         from = failedConnections(i).from.id;
+            %         to = failedConnections(i).to.id;
+            %         nextFailureTime = failedNodes(i).nextFailureTime;
+            %         nextRecoveryTime = failedNodes(i).nextRecoveryTime;
+            %         fprintf('%-5d -> %-5d; %-20.4f %-20.4f\n', from, to, nextFailureTime, nextRecoveryTime);
+            % end
+        end
+        
+        function processRepairQueue(obj, currentTime)
+            nodesToRemove = [];
+            for i = 1:length(obj.repairQueueNodes)
+                node = obj.repairQueueNodes(i);
+                
+                if currentTime >= node.recoveryStartTime && obj.repairTeamsBusy < obj.repairTeamsTotal
+                    % Назначаем бригаду на восстановление
+                    obj.repairTeamsBusy = obj.repairTeamsBusy + 1;
+                    recoveryDuration = node.meanRecoveryTime;
+                    node.nextRecoveryTime = node.recoveryStartTime + recoveryDuration;
+                    
+                    fprintf('[Exp: %d] Бригада начала восстановление узла %d в %.1f. Завершение в %.1f. Доступно бригад: %d\n', ...
+                        obj.exp, node.id, node.recoveryStartTime, node.recoveryStartTime + recoveryDuration, obj.repairTeamsTotal - obj.repairTeamsBusy);
+                    
+                    nodesToRemove = [nodesToRemove, i];
+                end
+            end
+            obj.repairQueueNodes(nodesToRemove) = [];
+            
+            % Обработка очереди соединений
+            connsToRemove = [];
+            for i = 1:length(obj.repairQueueConns)
+                conn = obj.repairQueueConns(i);
+                
+                if currentTime >= conn.recoveryStartTime && obj.repairTeamsBusy < obj.repairTeamsTotal
+                    % Назначаем бригаду на восстановление
+                    obj.repairTeamsBusy = obj.repairTeamsBusy + 1;
+                    recoveryDuration = conn.meanRecoveryTime;
+                    conn.nextRecoveryTime = currentTime + recoveryDuration;
+                    
+                    fprintf('[Exp: %d] Бригада начала восстановление соединения %s в %.1f. Завершение в %.1f. Доступно бригад: %d\n', ...
+                        obj.exp, conn.name, conn.recoveryStartTime, conn.recoveryStartTime + recoveryDuration, obj.repairTeamsTotal - obj.repairTeamsBusy);
+                    
+                    connsToRemove = [connsToRemove, i];
+                end
+            end
+            obj.repairQueueConns(connsToRemove) = [];
+        end
+        
+        function handleRecoveries(obj, currentTime)
+            % Обработка узлов
+            for i = 1:length(obj.nodes)
+                node = obj.nodes(i);
+                
+                if node.isClientNode
+                    continue;
+                end
+                
+                % Моделируем восстановление узла
+                if node.isFailed && ~isempty(node.nextRecoveryTime) && currentTime >= node.nextRecoveryTime
+                    recTime = node.nextRecoveryTime;
+                    node.isFailed = false;
+                    node.scheduleNextFailure(currentTime);
+                    obj.repairTeamsBusy = obj.repairTeamsBusy - 1;
+                    node.nextRecoveryTime = NaN;
+                    obj.nodeFailures = obj.nodeFailures - 1;
+                    fprintf('[Exp: %d] Узел %d восстановлен в момент времени %.1f. Планируемый отказ: %.1f. Доступно бригад: %d\n', obj.exp, node.id, recTime, node.nextFailureTime, obj.repairTeamsTotal - obj.repairTeamsBusy);
+                end
+            end
+            
+            % Обработка соединений
+            for i = 1:length(obj.connections)
+                conn = obj.connections(i);
+                
+                % Моделируем восстановление соединения
+                if conn.isFailed && ~isempty(conn.nextRecoveryTime) && currentTime >= conn.nextRecoveryTime
+                    conn.isFailed = false;
+                    conn.scheduleNextFailure(currentTime);
+                    obj.repairTeamsBusy = obj.repairTeamsBusy - 1;
+                    obj.connFailures = obj.connFailures - 1;
+                    
+                    conn.nextRecoveryTime = NaN;
+                    fprintf('[Exp: %d] Соединение %s восстановлено в момент времени %.1f. Планируемый отказ: %.1f. Доступно бригад: %d\n', obj.exp, conn.name, conn.nextRecoveryTime, conn.nextFailureTime, obj.repairTeamsTotal - obj.repairTeamsBusy);
+                end
+            end
+            
+            obj.processRepairQueue(currentTime);
+            
+            % Логирование
+            % failedNodes = obj.nodes([obj.nodes.isFailed]);
+            % failedConnections = obj.connections([obj.connections.isFailed]);
+            % fprintf('Current time: %.2f FAILED NODES:\n', obj.currentTime);
+            % fprintf('%-10s %-20s %-20s\n', 'Index', 'Failure Time', 'Next Recovery Time');
+            % for i = 1:length(failedNodes)
+            %         idx = failedNodes(i).id;
+            %         nextFailureTime = failedNodes(i).nextFailureTime;
+            %         nextRecoveryTime = failedNodes(i).nextRecoveryTime;
+            %         fprintf('%-10d %-20.4f %-20.4f\n', idx, nextFailureTime, nextRecoveryTime);
+            % end
+            % fprintf('Current time: %.2f FAILED CONNECTIONS:\n', obj.currentTime);
+            % fprintf('%-10s %-20s %-20s\n', 'From -> To', 'Failure Time', 'Next Recovery Time');
+            % for i = 1:length(failedConnections)
+            %         from = failedConnections(i).from.id;
+            %         to = failedConnections(i).to.id;
+            %         nextFailureTime = failedNodes(i).nextFailureTime;
+            %         nextRecoveryTime = failedNodes(i).nextRecoveryTime;
+            %         fprintf('%-5d -> %-5d; %-20.4f %-20.4f\n', from, to, nextFailureTime, nextRecoveryTime);
+            % end
+        end
+        
+        function handleServiceRecoveries(obj, currentTime)
+            % Обработка узлов
+            for i = 1:length(obj.nodes)
+                node = obj.nodes(i);
+                
+                if node.isClientNode
+                    continue;
+                end
+                
+                % Моделируем восстановление узла
+                if node.isFailed
+                    recTime = node.nextRecoveryTime;
+                    node.isFailed = false;
+                    node.scheduleNextFailure(currentTime + obj.serviceTime);
+                    % Если узел был в очереди на восстановление, удаляем его
+                    idx = find(obj.repairQueueNodes == node, 1);
+                    if ~isempty(idx)
+                        obj.repairQueueNodes(idx) = [];
+                    end
+                    node.nextRecoveryTime = NaN;
+                    % fprintf('Узел %d восстановлен в момент времени %.1f\n', node.id, recTime);
+                end
+            end
+            
+            % Обработка соединений
+            for i = 1:length(obj.connections)
+                conn = obj.connections(i);
+                
+                % Моделируем восстановление соединения
+                if conn.isFailed
+                    conn.isFailed = false;
+                    conn.scheduleNextFailure(currentTime + obj.serviceTime);
+                    conn.nextRecoveryTime = NaN;
+                    % Если соединение было в очереди на восстановление, удаляем его
+                    idx = find(obj.repairQueueConns == conn, 1);
+                    if ~isempty(idx)
+                        obj.repairQueueConns(idx) = [];
+                    end
+                    % fprintf('Соединение %s восстановлено в момент времени %.1f\n', conn.name, conn.nextRecoveryTime);
+                end
+            end
+            
+            % Все бригады становятся свободными после обслуживания
+            obj.repairTeamsBusy = 0;
+            
+            % Логирование
+            % failedNodes = obj.nodes([obj.nodes.isFailed]);
+            % failedConnections = obj.connections([obj.connections.isFailed]);
+            % fprintf('Current time: %.2f FAILED NODES:\n', obj.currentTime);
+            % fprintf('%-10s %-20s %-20s\n', 'Index', 'Failure Time', 'Next Recovery Time');
+            % for i = 1:length(failedNodes)
+            %         idx = failedNodes(i).id;
+            %         nextFailureTime = failedNodes(i).nextFailureTime;
+            %         nextRecoveryTime = failedNodes(i).nextRecoveryTime;
+            %         fprintf('%-10d %-20.4f %-20.4f\n', idx, nextFailureTime, nextRecoveryTime);
+            % end
+            % fprintf('Current time: %.2f FAILED CONNECTIONS:\n', obj.currentTime);
+            % fprintf('%-10s %-20s %-20s\n', 'From -> To', 'Failure Time', 'Next Recovery Time');
+            % for i = 1:length(failedConnections)
+            %         from = failedConnections(i).from.id;
+            %         to = failedConnections(i).to.id;
+            %         nextFailureTime = failedNodes(i).nextFailureTime;
+            %         nextRecoveryTime = failedNodes(i).nextRecoveryTime;
+            %         fprintf('%-5d -> %-5d; %-20.4f %-20.4f\n', from, to, nextFailureTime, nextRecoveryTime);
+            % end
+        end
+        
+        function [connParams, zoneName] = determineConnectionZone(obj, nodeIdx1, nodeIdx2)
+            % Определяем зону соединения:
+            % CL: узел 1-48 соединен с 49-54
+            % LOC: узлы 49-57 между собой
+            % GL: узел 57 с 58 и 58-70 между собой
+            
+            if (nodeIdx1 >= 1 && nodeIdx1 <= 48) && (nodeIdx2 >= 49 && nodeIdx2 <= 54) || ...
+                    (nodeIdx2 >= 1 && nodeIdx2 <= 48) && (nodeIdx1 >= 49 && nodeIdx1 <= 54)
+                zoneName = 'CL';
+            elseif (nodeIdx1 >= 49 && nodeIdx1 <= 57) && (nodeIdx2 >= 49 && nodeIdx2 <= 57)
+                zoneName = 'LOC';
+            elseif (nodeIdx1 == 57 && nodeIdx2 == 58) || (nodeIdx1 == 58 && nodeIdx2 == 57) || ...
+                    (nodeIdx1 >= 58 && nodeIdx2 >= 58)
+                zoneName = 'GL';
+            else
+                zoneName = 'DEFAULT';
+            end
+            
+            % Получаем параметры зоны
+            if isKey(obj.connectionZonesInfo, zoneName)
+                connParams = obj.connectionZonesInfo(zoneName);
+            else
+                connParams = struct(...
+                    'failureRate', 1e-6, ...
+                    'meanRecoveryTime', 60);
+            end
+        end
+        
+        
+        function [T0_1, T0_2, Tv_1, Tv_2, Kg_1, Kg_2] = calculateCurrentMetrics(obj)
+            % Расчет текущих показателей надежности
+            Ts1 = obj.stateTimes(1);
+            Ts2 = obj.stateTimes(2);
+            Ts3 = obj.stateTimes(3);
+            
+            countTransitionsToS1 = obj.stateTransitions(2,1) + obj.stateTransitions(3,1);
+            countTransitionsFromS3 = obj.stateTransitions(3,1) + obj.stateTransitions(3,2);
+            countTransitionsFromS1 = obj.stateTransitions(1,2) + obj.stateTransitions(1,3);
+            countTransitionsToS3 = obj.stateTransitions(1,3) + obj.stateTransitions(2,3);
+            
+            totalTime = obj.currentTime;
+            totalTimeWithoutService = totalTime - obj.serviceTime * floor((totalTime / (obj.servicePeriod + obj.serviceTime)));
+            
+            if Ts1 < obj.serviceTime * floor((totalTime / (obj.servicePeriod + obj.serviceTime)))
+                Ts1WithoutService = Ts1;
+            else
+                Ts1WithoutService = Ts1 - obj.serviceTime * floor((totalTime / (obj.servicePeriod + obj.serviceTime)));
+            end
+            
+            % Расчет наработки на отказ и времени восстановления
+            T0_1 = Ts1WithoutService / (1 + countTransitionsFromS1);
+            T0_2 = (Ts1WithoutService + Ts2) / (1 + countTransitionsToS3);
+            
+            if Ts2 + Ts3 < (obj.reactionTime * (countTransitionsToS1))
+                Tv_1 = Ts2 + Ts3;
+            else
+                Tv_1 = Ts2 + Ts3 - (obj.reactionTime * (countTransitionsToS1));
+            end
+            
+            if Ts3 < (obj.reactionTime * (countTransitionsFromS3))
+                Tv_2 = Ts3;
+            else
+                Tv_2 = Ts3 - (obj.reactionTime * (countTransitionsFromS3));
+            end
+            
+            Kg_1 = T0_1 / (T0_1 + Tv_1);
+            Kg_2 = T0_2 / (T0_2 + Tv_2);
+        end
+        
+        function obj = plotReliabilityMetrics(obj)
+            figure;
+            
+            subplot(2,3,1);
+            plot(obj.time_history, obj.T0_1_history);
+            title('Динамика T0_1 - Наработка на отказ (S1)');
+            xlabel('Время, с');
+            ylabel('T0_1, с');
+            grid on;
+            
+            subplot(2,3,2);
+            plot(obj.time_history, obj.Tv_1_history);
+            title('Динамика Tv_1 - Время восстановления (S2+S3)');
+            xlabel('Время, с');
+            ylabel('Tv_1, с');
+            grid on;
+            
+            subplot(2,3,3);
+            plot(obj.time_history, obj.Kg_1_history);
+            title('Динамика Kg_1 - Коэффициент готовности (S1)');
+            xlabel('Время, с');
+            ylabel('Kg_1');
+            grid on;
+            
+            subplot(2,3,4);
+            plot(obj.time_history, obj.T0_2_history);
+            title('Динамика T0_2 - Наработка на отказ (S1+S2)');
+            xlabel('Время, с');
+            ylabel('T0_2, с');
+            grid on;
+            
+            subplot(2,3,5);
+            plot(obj.time_history, obj.Tv_2_history);
+            title('Динамика Tv_2 - Время восстановления (S3)');
+            xlabel('Время, с');
+            ylabel('Tv_2, с');
+            grid on;
+            
+            subplot(2,3,6);
+            plot(obj.time_history, obj.Kg_2_history);
+            title('Динамика Kg_2 - Коэффициент готовности (S1 + S2)');
+            xlabel('Время, с');
+            ylabel('Kg_2');
+            grid on;
+            
+            % Улучшаем расположение графиков
+            set(gcf, 'Position', [100, 100, 1000, 800]);
+        end
+        
+        function obj = plotStateTimes(obj)
+            figure('Name', 'Время в состояниях сети', 'NumberTitle', 'off');
+            
+            subplot(2,1,1);
+            
+            % Данные для диаграммы
+            states = {'S1', 'S2', 'S3'};
+            times = obj.stateTimes;
+            
+            % Создание столбчатой диаграммы
+            h = bar(times);
+            title(sprintf('Время нахождения сети в состояниях (Эксперимент %d)', obj.exp));
+            xlabel('Состояние сети');
+            ylabel('Время, секунды');
+            set(gca, 'XTickLabel', states);
+            grid on;
+            % Настраиваем цвета столбцов
+            colors = [0.2 0.8 0.2;   % Зеленый для S1
+                0.9 0.9 0.2;   % Желтый для S2
+                0.8 0.2 0.2];  % Красный для S3
+            h.FaceColor = 'flat';
+            for k = 1:size(colors,1)
+                h.CData(k,:) = colors(k,:);
+            end
+            
+            total_time = sum(times);
+            percentages = 100 * times / total_time;
+            
+            
+            % Текстовые метки
+            for i = 1:length(times)
+                text(i, times(i), sprintf('%.1f с\n(%.1f%%)', times(i), percentages(i)), ...
+                    'HorizontalAlignment', 'center', ...
+                    'VerticalAlignment', 'bottom');
+            end
+            
+            subplot(2,1,2);
+            
+            % Создаем временную шкалу (предполагаем, что obj.time_history доступен)
+            time_points = obj.time_history;
+            state_points = obj.state_history;
+            stairs_time = repelem(time_points(1:end-1), 2);
+            stairs_time = [stairs_time, time_points(end)];
+            stairs_state = repelem(state_points(1:end), 2);
+            stairs_state = stairs_state(1:end-1)
+            
+            % Создаем ступенчатый график
+            stairs(time_points, state_points, 'LineWidth', 2, 'Color', 'k');
+            
+            % Настраиваем ось Y для отображения состояний
+            ylim([0.5 3.5]);
+            set(gca, 'YTick', [1 2 3], 'YTickLabel', states);
+            
+            title('Динамика изменения состояний сети');
+            xlabel('Время, секунды');
+            ylabel('Состояние');
+            grid on;
+            
+            % Добавляем цветные области для каждого состояния
+            hold on;
+            for i = 2:length(time_points)
+                state = state_points(i);
+                color = colors(state,:);
+                area([time_points(i) time_points(i-1)], [state state], ...
+                    'FaceColor', color, 'FaceAlpha', 0.3, 'EdgeColor', 'none');
+            end
+            hold off;
+        end
+        
+        function obj = plotNetworkStats(obj)
+            figure('Name', 'Статистика пакетов и отказов', 'NumberTitle', 'off', 'Position', [100, 100, 1000, 800]);
+            
+            subplot(3,1,1);
+            plot(obj.time_history, [obj.packetsGenerated_history], 'b-', 'LineWidth', 1, 'DisplayName', 'Сгенерировано');
+            hold on;
+            plot(obj.time_history, [obj.packetsDelivered_history], 'g-', 'LineWidth', 1, 'DisplayName', 'Доставлено');
+            plot(obj.time_history, [obj.packetsLost_history], 'r-', 'LineWidth', 1, 'DisplayName', 'Потеряно');
+            plot(obj.time_history, [obj.packetsExpired_history], 'm-', 'LineWidth', 1, 'DisplayName', 'Просрочено');
+            hold off;
+            
+            title('Динамика обработки пакетов');
+            xlabel('Время, с');
+            ylabel('Количество пакетов');
+            legend('show', 'Location', 'best');
+            grid on;
+            
+            subplot(3,1,2);
+            plot(obj.time_history, [obj.nodeFailures_history], 'r-', 'LineWidth', 1, 'DisplayName', 'Отказы узлов');
+            hold on;
+            plot(obj.time_history, [obj.connFailures_history], 'b-', 'LineWidth', 1, 'DisplayName', 'Отказы соединений');
+            hold off;
+            
+            title('Динамика отказов');
+            xlabel('Время, с');
+            ylabel('Количество отказов');
+            legend('show', 'Location', 'best');
+            grid on;
+            
+            % 3. График средней интенсивности трафика
+            subplot(3,1,3);
+            
+            % Вычисляем среднюю интенсивность по всем клиентам для каждого временного шага
+            mean_send_intensity = zeros(size(obj.time_history));
+            mean_receive_intensity = zeros(size(obj.time_history));
+            
+            for i = 1:length(obj.time_history)
+                % Собираем интенсивности всех клиентов для текущего временного шага
+                send_intensities = arrayfun(@(c) c.sendIntensity_history(i), obj.clients);
+                receive_intensities = arrayfun(@(c) c.receiveIntensity_history(i), obj.clients);
+                
+                % Вычисляем средние значения
+                mean_send_intensity(i) = mean(send_intensities);
+                mean_receive_intensity(i) = mean(receive_intensities);
+            end
+            
+            plot(obj.time_history, mean_send_intensity, 'r--', 'LineWidth', 1, 'DisplayName', 'Ср. исходящая интенсивность');
+            hold on;
+            plot(obj.time_history, mean_receive_intensity, 'b--', 'LineWidth', 1, 'DisplayName', 'Ср. входящая интенсивность');
+            hold off;
+            
+            title('Средняя интенсивность трафика клиентов');
+            xlabel('Время, с');
+            ylabel('Интенсивность (пакетов/с)');
+            legend('show', 'Location', 'best');
+            grid on;
+        end
+        
+        function changeNetworkState(obj)
+            % 2. Расчет интенсивности каждые timeStep секунд
+            numReceivingClients = 0;
+            numSendingClients = sum([obj.clients.isClientSent]);
+            for c = 1:length(obj.clients)
+                client = obj.clients(c);
+                client.calculateIntensity(obj.currentTime, obj.timeStep);
+                
+                % Проверяем, получает ли клиент кадры
+                if client.isClientSent == true && client.packetStats.receiveIntensity > obj.V_THRESHOLD * client.packetStats.sendIntensity
+                    numReceivingClients = numReceivingClients + 1;
+                end
+            end
+            
+            % Вывод о состоянии сети
+            prevState = obj.currentState;
+            receivingRatio = numReceivingClients / max(1, numSendingClients);
+            if receivingRatio >= obj.S2_CRITICAL
+                newState = 1; % S1
+            elseif receivingRatio >= obj.S3_CRITICAL
+                newState = 2; % S2
+            else
+                newState = 3; % S3
+            end
+            
+            if newState ~= obj.currentState
+                obj.stateTransitions(obj.currentState, newState) = obj.stateTransitions(obj.currentState, newState) + 1;
+                fprintf('\n[Exp: %d] Состояние сети изменилось: S%d -> S%d\n', obj.exp, prevState, newState);
+            end
+            
+            % timeInState = obj.currentTime - obj.lastStateChangeTime;
+            obj.stateTimes(newState) = obj.stateTimes(newState) + obj.timeStep;
+            
+            % Обновляем текущее состояние
+            obj.currentState = newState;
+            obj.lastStateChangeTime = obj.currentTime;
+        end
+        
+        
+        
+    end
+    
+end
+
